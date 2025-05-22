@@ -63,17 +63,39 @@ async def upload_youtube(req: YouTubeRequest):
     video_id = extract_youtube_id(req.url)
     try:
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        if 'zh-TW' in [t.language_code for t in transcripts]:
-            transcript = transcripts.find_transcript(['zh-TW'])
-        else:
-            transcript = transcripts.find_translatable_transcript(['zh'])
+
+        print("YouTube Transcript List:")
+        for t in transcripts:
+            print(f"  Language: {t.language_code}, Translatable: {t.is_translatable}")
+        print("End Transcript List")
+
+        preferred_languages = ['zh-TW', 'zh', 'en', 'en-GB']
+        found = False
+        for lang in preferred_languages:
+            try:
+                transcript = transcripts.find_transcript([lang])
+                print(f"Found transcript in language: {lang}")
+                found = True
+                break
+            except:
+                continue
+
+        if not found:
+            transcript = transcripts.find_translatable_transcript(['zh', 'en'])
+            print(f"Using translatable transcript in language: {transcript.language_code}")
 
         transcript_list = transcript.fetch()
-    except (NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript, ParseError) as e:
+
+        print("Transcript Fetch Result (first 3 lines):")
+        for item in transcript_list[:3]:
+            print(item)
+        print("End Fetch Result")
+
+        text = " ".join([item.text for item in transcript_list])
+
+    except (NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript, ParseError, Exception) as e:
+        print("Transcript fetch error:", str(e))
         return {"error": f"Transcript unavailable or corrupted: {str(e)}"}
-
-    text = " ".join([item.text for item in transcript_list])
-
 
     with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as f:
         f.write(text)
