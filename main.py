@@ -1,22 +1,27 @@
-# main.py
-
-from fastapi import FastAPI, UploadFile, Form, File
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel, Field
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_community.chat_models import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
-import requests
-import json
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
 from urllib.parse import urlparse, parse_qs
 from defusedxml.ElementTree import ParseError
 from dotenv import load_dotenv
-load_dotenv()
+
+load_dotenv(override=True)
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+if openai_api_key:
+    print("OPENAI_API_KEY loaded, begins with:", openai_api_key[:15])
+else:
+    print("OPENAI_API_KEY not found")
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 app = FastAPI(
     title="Podcast Summarization API with LLM/RAG",
@@ -92,7 +97,6 @@ async def process_text(text: str):
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     docs = splitter.create_documents([text])
 
-    embeddings = OpenAIEmbeddings()
     db = FAISS.from_documents(docs, embeddings)
     db.save_local(FAISS_INDEX_PATH)
 
@@ -100,15 +104,14 @@ async def process_text(text: str):
 
 @app.post("/ask", summary="Ask a question", description="Ask a question related to the uploaded transcript or YouTube video.")
 async def ask_question(req: QARequest):
-    embeddings = OpenAIEmbeddings()
     db = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
     retriever = db.as_retriever()
 
-    # Show what we ask FAISS
-    retrieved_docs = retriever.get_relevant_documents(req.question)
+    retrieved_docs = retriever.invoke(req.question)
 
-    qa = RetrievalQA.from_chain_type(llm=ChatOpenAI(), retriever=retriever, return_source_documents=True)
-    result = qa({"query": req.question})
+    llm = ChatOpenAI(model_name="gpt-4o", openai_api_key=openai_api_key)
+    qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+    result = qa.invoke({"query": req.question})
 
     print("\n--- GPT REQUEST DEBUG ---")
     print("Question:", req.question)
@@ -120,7 +123,6 @@ async def ask_question(req: QARequest):
 
 @app.get("/documents", summary="List all stored documents", description="Returns all documents currently stored in the FAISS vector store.")
 async def list_documents():
-    embeddings = OpenAIEmbeddings()
     db = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
     docs = db.similarity_search("", k=1000)
     return {
