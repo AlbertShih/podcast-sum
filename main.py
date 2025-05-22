@@ -32,7 +32,7 @@ app = FastAPI(
 # Enable CORS for frontend testing
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://albertshih.github.io/podcast-sum-ui"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
