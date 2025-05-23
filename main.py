@@ -12,8 +12,20 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 from urllib.parse import urlparse, parse_qs
 from defusedxml.ElementTree import ParseError
 from dotenv import load_dotenv
+import yt_dlp
+import ffmpeg
+import tempfile
+import re
+from fastapi import APIRouter
+from pydantic import BaseModel, Field
+from openai import OpenAI
 
-load_dotenv(override=True)
+
+
+print(shutil.which("ffmpeg"))
+print(shutil.which("ffprobe"))
+
+load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
 if openai_api_key:
@@ -23,6 +35,9 @@ else:
 
 # Use OpenAI embeddings to save memory
 embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+
+# OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(
     title="Podcast Summarization API with LLM/RAG",
@@ -157,3 +172,91 @@ async def list_documents():
         "total": len(docs),
         "documents": [doc.page_content for doc in docs]
     }
+
+@app.post("/transcribe-youtube-whisper", summary="Transcribe YouTube video using Whisper >=1.x")
+async def transcribe_youtube_whisper(req: YouTubeRequest):
+    """Workflow:
+    1. Download best audio with yt‑dlp.
+    2. Convert to mp3 with ffmpeg.
+    3. Whisper transcription (tries zh then en).
+    4. Clean transcript of zero‑width / control characters.
+    5. Pass cleaned text to process_text().
+    """
+
+    # -------- create temp paths --------
+    temp_dir = tempfile.mkdtemp(prefix="yt_")
+    raw_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+
+    try:
+        # 1. download
+        print(f"[1] Downloading audio from {req.url}")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": raw_template,
+            "quiet": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(req.url, download=True)
+            raw_path: str = info["requested_downloads"][0]["filepath"]
+        print(f"[1] Download complete -> {raw_path}")
+
+        # 2. convert to mp3
+        mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+        print(f"[2] Converting to mp3 -> {mp3_path}")
+        (
+            ffmpeg.input(raw_path)
+            .output(mp3_path, acodec="libmp3lame", format="mp3")
+            .run(overwrite_output=True, quiet=True)
+        )
+        print("[2] Conversion done")
+
+        # 3. whisper
+        transcript_text = None
+        for lang in ("zh", "en"):
+            try:
+                print(f"[3] Whisper transcription try lang={lang}")
+                with open(mp3_path, "rb") as f:
+                    resp = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        language=lang,
+                    )
+                transcript_text = resp.text
+                print(f"[3] Whisper success lang={lang}")
+                break
+            except Exception as e:
+                print(f"[3] Whisper failed lang={lang}: {e}")
+
+        if not transcript_text:
+            return {"error": "Whisper transcription failed for zh and en."}
+
+        print(f"transcript_text=${transcript_text}")
+
+        # 4. clean transcript
+        def clean(txt: str) -> str:
+            txt = re.sub(r"[\u200B-\u200F\u2028\u2029\u00AD]", "", txt)
+            txt = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u4E00-\u9FFF]+", " ", txt)
+            return re.sub(r"\s+", " ", txt).strip()
+
+        clean_text = clean(transcript_text)
+        print(f"[4] Transcript cleaned; length={len(clean_text)} chars")
+
+        # save
+        with open("transcript.txt", "w", encoding="utf-8") as fp:
+            fp.write(clean_text)
+        print("[4] Transcript saved to transcript.txt")
+
+        # 5. FAISS processing
+        from main import process_text  # deferred import to avoid circular deps
+        return await process_text(clean_text)
+
+    except Exception as e:
+        print("\n--- Whisper YouTube Exception ---")
+        print("Error:", e)
+        print(traceback.format_exc())
+        print("--- End Exception ---\n")
+        return {"error": f"Failed: {e}"}
+
+    finally:
+        print(f"[5] Removing temp dir {temp_dir}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
