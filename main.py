@@ -2,8 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel, Field
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.chains import RetrievalQA
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -22,7 +21,8 @@ if openai_api_key:
 else:
     print("OPENAI_API_KEY not found")
 
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# Use OpenAI embeddings to save memory
+embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
 
 app = FastAPI(
     title="Podcast Summarization API with LLM/RAG",
