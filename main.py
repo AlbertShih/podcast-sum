@@ -173,81 +173,79 @@ async def list_documents():
         "documents": [doc.page_content for doc in docs]
     }
 
+# -------------- constants -----------------
+WHISPER_SIZE_LIMIT = 25 * 1024 * 1024   # 25 MB
+LOW_BITRATE = "48k"                     # bitrate used when re‑encoding oversize files
+
 @app.post("/transcribe-youtube-whisper", summary="Transcribe YouTube video using Whisper >=1.x")
 async def transcribe_youtube_whisper(req: YouTubeRequest):
     """Workflow:
-    1. Download best audio with yt‑dlp.
-    2. Convert to mp3 with ffmpeg.
-    3. Whisper transcription (tries zh then en).
-    4. Clean transcript of zero‑width / control characters.
-    5. Pass cleaned text to process_text().
+    1. yt‑dlp downloads bestaudio to *raw_path*.
+    2. If raw audio < 25 MB and format accepted by Whisper, upload as‑is.
+       Otherwise re‑encode to 48 kbps mono MP3 until < 25 MB.
+    3. Whisper transcription with zh → en fallback.
+    4. Clean transcript (remove zero‑width / control chars) and hand to process_text().
     """
 
-    # -------- create temp paths --------
     temp_dir = tempfile.mkdtemp(prefix="yt_")
     raw_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
 
     try:
-        # 1. download
-        print(f"[1] Downloading audio from {req.url}")
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": raw_template,
-            "quiet": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # -------- 1. Download audio --------
+        print(f"[1] Downloading audio: {req.url}")
+        with yt_dlp.YoutubeDL({"format": "bestaudio/best", "outtmpl": raw_template, "quiet": True}) as ydl:
             info = ydl.extract_info(req.url, download=True)
-            raw_path: str = info["requested_downloads"][0]["filepath"]
-        print(f"[1] Download complete -> {raw_path}")
+            raw_path = info["requested_downloads"][0]["filepath"]
+        raw_size = os.path.getsize(raw_path)
+        print(f"[1] Download complete -> {raw_path} ({raw_size/1e6:.2f} MB)")
 
-        # 2. convert to mp3
-        mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-        print(f"[2] Converting to mp3 -> {mp3_path}")
-        (
-            ffmpeg.input(raw_path)
-            .output(mp3_path, acodec="libmp3lame", format="mp3")
-            .run(overwrite_output=True, quiet=True)
-        )
-        print("[2] Conversion done")
+        # -------- 2. Decide whether to re‑encode --------
+        final_audio = raw_path
+        if raw_size >= WHISPER_SIZE_LIMIT:
+            final_audio = os.path.join(temp_dir, "audio_low.mp3")
+            print(f"[2] Re‑encoding oversize audio to {LOW_BITRATE} mono MP3 -> {final_audio}")
+            (
+                ffmpeg.input(raw_path)
+                      .output(final_audio, acodec="libmp3lame", audio_bitrate=LOW_BITRATE, ac=1, format="mp3")
+                      .run(overwrite_output=True, quiet=True)
+            )
+            comp_size = os.path.getsize(final_audio)
+            print(f"[2] Compressed size = {comp_size/1e6:.2f} MB")
+            if comp_size >= WHISPER_SIZE_LIMIT:
+                return {"error": "Audio still exceeds 25 MB after compression; consider slicing."}
+        else:
+            print("[2] Original file within size limit; no re‑encode.")
 
-        # 3. whisper
-        transcript_text = None
+        # -------- 3. Whisper transcription --------
+        transcript = None
         for lang in ("zh", "en"):
             try:
-                print(f"[3] Whisper transcription try lang={lang}")
-                with open(mp3_path, "rb") as f:
-                    resp = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        language=lang,
-                    )
-                transcript_text = resp.text
+                print(f"[3] Whisper try lang={lang}")
+                with open(final_audio, "rb") as f:
+                    resp = client.audio.transcriptions.create(model="whisper-1", file=f, language=lang)
+                transcript = resp.text
                 print(f"[3] Whisper success lang={lang}")
                 break
             except Exception as e:
                 print(f"[3] Whisper failed lang={lang}: {e}")
 
-        if not transcript_text:
-            return {"error": "Whisper transcription failed for zh and en."}
+        if not transcript:
+            return {"error": "Whisper transcription failed."}
 
-        print(f"transcript_text=${transcript_text}")
-
-        # 4. clean transcript
+        # -------- 4. Clean transcript --------
         def clean(txt: str) -> str:
             txt = re.sub(r"[\u200B-\u200F\u2028\u2029\u00AD]", "", txt)
             txt = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u4E00-\u9FFF]+", " ", txt)
             return re.sub(r"\s+", " ", txt).strip()
 
-        clean_text = clean(transcript_text)
-        print(f"[4] Transcript cleaned; length={len(clean_text)} chars")
+        clean_text = clean(transcript)
+        print(f"[4] Cleaned transcript length = {len(clean_text)} chars")
 
-        # save
         with open("transcript.txt", "w", encoding="utf-8") as fp:
             fp.write(clean_text)
-        print("[4] Transcript saved to transcript.txt")
+        print("[4] Saved transcript.txt")
 
-        # 5. FAISS processing
-        from main import process_text  # deferred import to avoid circular deps
+        from main import process_text  # late import to avoid circular deps
         return await process_text(clean_text)
 
     except Exception as e:
