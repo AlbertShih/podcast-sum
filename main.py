@@ -8,6 +8,7 @@ from langchain.chains import RetrievalQA
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
+import traceback
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
 from urllib.parse import urlparse, parse_qs
 from defusedxml.ElementTree import ParseError
@@ -93,8 +94,13 @@ async def upload_youtube(req: YouTubeRequest):
 
         text = " ".join([item.text for item in transcript_list])
 
-    except (NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript, ParseError, Exception) as e:
-        print("Transcript fetch error:", str(e))
+    except Exception as e:
+        print("\n--- Transcript Fetch Exception ---")
+        print("Error type:", type(e).__name__)
+        print("Error message:", str(e))
+        print("Traceback:")
+        print(traceback.format_exc())
+        print("--- End Exception ---\n")
         return {"error": f"Transcript unavailable or corrupted: {str(e)}"}
 
     with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as f:
